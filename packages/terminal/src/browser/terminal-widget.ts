@@ -6,18 +6,16 @@
  */
 
 import * as Xterm from 'xterm';
+import { proposeGeometry } from 'xterm/lib/addons/fit/fit';
 import { inject, injectable, named, postConstruct } from "inversify";
 import { Disposable, DisposableCollection, ILogger } from '@theia/core/lib/common';
-import { Widget, BaseWidget, Message, WebSocketConnectionProvider, StatefulWidget, isFirefox } from '@theia/core/lib/browser';
+import { Widget, BaseWidget, Message, WebSocketConnectionProvider, StatefulWidget, isFirefox, MessageLoop } from '@theia/core/lib/browser';
 import { WorkspaceService } from "@theia/workspace/lib/browser";
 import { ShellTerminalServerProxy } from '../common/shell-terminal-protocol';
 import { terminalsPath } from '../common/terminal-protocol';
 import { IBaseTerminalServer } from '../common/base-terminal-protocol';
 import { TerminalWatcher } from '../common/terminal-watcher';
 import { ThemeService } from "@theia/core/lib/browser/theming";
-import { Deferred } from "@theia/core/lib/common/promise-util";
-
-Xterm.Terminal.applyAddon(require('xterm/lib/addons/fit/fit'));
 
 export const TERMINAL_WIDGET_FACTORY_ID = 'terminal';
 
@@ -60,12 +58,6 @@ export class TerminalWidget extends BaseWidget implements StatefulWidget {
     private rows: number;
     protected restored = false;
     protected closeOnDispose = true;
-    protected openAfterShow = false;
-    protected isOpeningTerm = false;
-    protected isTermOpen = false;
-
-    protected readonly waitForResized = new Deferred<void>();
-    protected readonly waitForTermOpened = new Deferred<void>();
 
     @inject(WorkspaceService) protected readonly workspaceService: WorkspaceService;
     @inject(WebSocketConnectionProvider) protected readonly webSocketConnectionProvider: WebSocketConnectionProvider;
@@ -120,12 +112,6 @@ export class TerminalWidget extends BaseWidget implements StatefulWidget {
         this.term.on('title', (title: string) => {
             this.title.label = title;
         });
-        if (isFirefox) {
-            // The software scrollbars don't work with xterm.js, so we disable the scrollbar if we are on firefox.
-            this.waitForTermOpened.promise.then(() => {
-                (this.term.element.children.item(0) as HTMLElement).style.overflow = 'hidden';
-            });
-        }
 
         this.toDispose.push(this.terminalWatcher.onTerminalError(({ terminalId }) => {
             if (terminalId === this.terminalId) {
@@ -215,34 +201,15 @@ export class TerminalWidget extends BaseWidget implements StatefulWidget {
         };
     }
 
-    protected registerResize(): void {
-        this.term.on('resize', size => {
-            if (typeof this.terminalId !== "number") {
-                return;
-            }
-
-            if (!size) {
-                return;
-            }
-
-            this.cols = size.cols;
-            this.rows = size.rows;
-            this.shellTerminalServer.resize(this.terminalId, this.cols, this.rows);
-        });
-    }
-
     /**
      * Create a new shell terminal in the back-end and attach it to a
      * new terminal widget.
      * If id is provided attach to the terminal for this id.
      */
     async start(id?: number): Promise<void> {
-        await this.waitForResized.promise;
         this.terminalId = typeof id !== 'number' ? await this.createTerminal() : await this.attachTerminal(id);
-        if (typeof this.terminalId === "number") {
-            await this.doResize();
-            this.connectTerminalProcess();
-        }
+        this.resizeTerminalProcess();
+        this.connectTerminalProcess();
     }
     protected async attachTerminal(id: number): Promise<number | undefined> {
         const terminalId = await this.shellTerminalServer.attach(id);
@@ -264,76 +231,55 @@ export class TerminalWidget extends BaseWidget implements StatefulWidget {
         return undefined;
     }
 
-    protected async openTerm(): Promise<void> {
-        this.isOpeningTerm = true;
-
-        if (this.isTermOpen === true) {
-            this.isOpeningTerm = false;
-            return Promise.reject("Already open");
+    processMessage(msg: Message): void {
+        super.processMessage(msg);
+        switch (msg.type) {
+            case 'fit-request':
+                this.onFitRequest(msg);
+                break;
+            default:
+                break;
         }
-
-        /* This may have changed since we waited for waitForStarted. Test it again.  */
-        if (this.isVisible === false) {
-            this.isOpeningTerm = false;
-            return Promise.reject("Not visible");
-        }
-
-        this.term.open(this.node);
-        this.registerResize();
-        this.isTermOpen = true;
-        this.waitForTermOpened.resolve();
-        return this.waitForTermOpened.promise;
     }
-
+    protected onFitRequest(msg: Message): void {
+        MessageLoop.sendMessage(this, Widget.ResizeMessage.UnknownSize);
+    }
     protected onActivateRequest(msg: Message): void {
-        super.onActivateRequest(msg);
-        if (this.isTermOpen) {
-            this.term.focus();
-        }
+        this.term.focus();
     }
-
     protected onAfterShow(msg: Message): void {
-        super.onAfterShow(msg);
-        if (this.openAfterShow) {
-            if (this.isOpeningTerm === false) {
-                this.openTerm().then(() => {
-                    this.openAfterShow = false;
-                    this.term.focus();
-                }).catch(e => {
-                    this.logger.error("Error opening terminal", e.toString());
-                });
-            }
-        } else {
-            this.term.focus();
-        }
+        this.update();
     }
-
     protected onAfterAttach(msg: Message): void {
-        super.onAfterAttach(msg);
-        if (this.isVisible) {
-            this.openTerm().then(() => {
-                this.term.focus();
-            }).catch(e => {
-                this.openAfterShow = true;
-                this.logger.error("Error opening terminal", e.toString());
-            });
-        } else {
-            this.openAfterShow = true;
-        }
+        this.update();
+    }
+    protected onResize(msg: Widget.ResizeMessage): void {
+        this.needsResize = true;
+        this.update();
     }
 
-    // tslint:disable-next-line:no-any
-    private resizeTimer: any;
+    protected termOpened = false;
+    protected needsResize = false;
+    protected onUpdateRequest(msg: Message): void {
+        super.onUpdateRequest(msg);
+        if (!this.isVisible || !this.isAttached) return;
 
-    protected onResize(msg: Widget.ResizeMessage): void {
-        super.onResize(msg);
-        this.waitForResized.resolve();
-        clearTimeout(this.resizeTimer);
-        this.resizeTimer = setTimeout(() => {
-            this.waitForTermOpened.promise.then(() => {
-                this.doResize();
-            });
-        }, 50);
+        if (!this.termOpened) {
+            this.term.open(this.node);
+            this.termOpened = true;
+
+            if (isFirefox) {
+                // The software scrollbars don't work with xterm.js, so we disable the scrollbar if we are on firefox.
+                (this.term.element.children.item(0) as HTMLElement).style.overflow = 'hidden';
+            }
+        }
+
+        if (this.needsResize) {
+            this.resizeTerminal();
+            this.needsResize = false;
+
+            this.resizeTerminalProcess();
+        }
     }
 
     protected connectTerminalProcess(): void {
@@ -371,11 +317,15 @@ export class TerminalWidget extends BaseWidget implements StatefulWidget {
         super.dispose();
     }
 
-    private async doResize() {
-        await Promise.all([this.waitForResized.promise, this.waitForTermOpened.promise]);
-        const geo = this.term.proposeGeometry();
+    protected resizeTerminal(): void {
+        const geo = proposeGeometry(this.term);
         this.cols = geo.cols;
         this.rows = geo.rows - 1; // subtract one row for margin
         this.term.resize(this.cols, this.rows);
+    }
+
+    protected resizeTerminalProcess(): void {
+        if (typeof this.terminalId !== "number") return;
+        this.shellTerminalServer.resize(this.terminalId, this.term.cols, this.term.rows);
     }
 }
