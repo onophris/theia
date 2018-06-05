@@ -7,13 +7,13 @@
 
 import { injectable, inject } from 'inversify';
 import URI from '@theia/core/lib/common/uri';
-import { Endpoint } from '@theia/core/lib/browser/endpoint';
 import { ApplicationShell } from '@theia/core/lib/browser/shell';
 import { WidgetManager } from '@theia/core/lib/browser/widget-manager';
 import { LabelProvider } from '@theia/core/lib/browser/label-provider';
+import { FrontendApplicationContribution } from '@theia/core/lib/browser/frontend-application';
 import { WidgetOpenHandler, WidgetOpenerOptions } from '@theia/core/lib/browser/widget-open-handler';
+import { MiniBrowserService } from '../common/mini-browser-service';
 import { MiniBrowser, MiniBrowserProps } from './mini-browser';
-import { FrontendApplicationContribution } from '@theia/core/lib/browser';
 
 /**
  * Further options for opening a new `Mini Browser` widget.
@@ -47,15 +47,11 @@ export class MiniBrowserOpenHandler extends WidgetOpenHandler<MiniBrowser> imple
     @inject(LabelProvider)
     protected readonly labelProvider: LabelProvider;
 
+    @inject(MiniBrowserService)
+    protected readonly miniBrowserService: MiniBrowserService;
+
     async onStart(): Promise<void> {
-        const url = new Endpoint().getRestUrl().resolve('mini-browser-supported-extensions').toString();
-        const response = await fetch(url);
-        if (response.status === 200) {
-            const body = await response.json();
-            if (body && body.extensions && Array.isArray(body.extensions)) {
-                this.supportedExtensions.push(...body.extensions);
-            }
-        }
+        this.supportedExtensions.push(...(await this.miniBrowserService.supportedFileExtension()));
     }
 
     canHandle(uri: URI): number {
